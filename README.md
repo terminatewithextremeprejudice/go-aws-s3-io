@@ -1,1 +1,1 @@
-# go-aws-s3-reader-writer
+# go-aws-s3-io
