@@ -1,7 +1,6 @@
 package s3io
 
 import (
-	"net/http"
 	"regexp"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -10,14 +9,13 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 )
 
-type S3config struct {
+type Bucket struct {
 	Region string
 	Prefix string
 	Bucket string
-	Token  string
 }
 
-type worker struct {
+type chunk struct {
 	ptr *[]byte
 	num int
 	off int64
@@ -43,9 +41,7 @@ var nonASCIIRegexp = regexp.MustCompile(`([^\x00-\x7F])`)
 
 // Implements DataStore interface
 type FileStore struct {
-	State uint8
-
-	Config *S3config
+	Config Bucket
 
 	// Service specifies an interface used to communicate with the S3 backend.
 	// Usually, this is an instance of github.com/aws/aws-sdk-go/service/s3.S3
@@ -85,9 +81,9 @@ type FileStore struct {
 	allocpool *Allocpool
 }
 
-func NewFileStore(config *S3config) *FileStore {
+func NewFileStore(bucket Bucket) *FileStore {
 	return &FileStore{
-		Config:            config,
+		Config:            bucket,
 		MinPartSize:       MIN_MULTIPART_SIZE,
 		MaxPartSize:       MAX_MULTIPART_SIZE,
 		MaxMultipartParts: MAX_MULTIPART_PARTS,
@@ -99,10 +95,10 @@ func NewFileStore(config *S3config) *FileStore {
 }
 
 // Initialize S3 session
-func (store *FileStore) Init(httpClient *http.Client) error {
+func (store *FileStore) Init() error {
 	// Create AWS Session
 	cfg := aws.NewConfig().WithRegion(store.Config.Region)
-	cfg.HTTPClient = httpClient
+	// cfg.HTTPClient = httpClient
 	sess := session.Must(session.NewSession(cfg))
 	store.Service = s3.New(sess, cfg)
 	return nil

@@ -17,7 +17,6 @@ type Writer struct {
 	length 	    *uint64
 	n 	    int
 	total 	    uint64 // total bytes written
-	numParts    int
 	partSize    uint64
 	partNum     int
 	metadata    MetaData
@@ -27,51 +26,48 @@ type Writer struct {
 	isMultipart bool
 	buf 	    []byte // buffer used on non multipart uploads
 	err 	    error
-	semaphore   chan int
-	mpartIn     chan *worker
+	mpartIn     chan *chunk
+	mpartDone   chan error
 }
 
 func (u *Writer) producer() {
-	var (
-		err error
-		workers chan *worker = make(chan *worker, u.maxWorkers)
-		hasError chan error = make(chan error, 0)
-	)
-	
-	go func() {
-		for chunk := range workers {
-			if err != nil {
-				u.semaphore <- 1
-				break
-			}
+	var responses chan chan error = make(chan chan error, u.maxWorkers)
 
-			go func(chunk *worker) {
-				defer u.store.allocpool.Free(*(chunk.ptr))
-				buf := (*(chunk.ptr))[chunk.off:chunk.end]
-				
-				if _, werr := u.writeChunk(u.key, u.multipartid, chunk.num, &buf); werr != nil {
-					err = werr
-					hasError <- err
-				}
-				
-				u.semaphore <- 1
-			}(chunk)
+	go func() {
+		for errc := range responses {
+			err := <-errc
+			// <- u.semaphore
+
+			if err != nil {
+				u.mpartDone <- err
+				goto exit
+			}
 		}
 
-		hasError <- nil
+		u.mpartDone <- nil
+exit:
 	}()
 
-	for part := range u.mpartIn {
-		workers <- part	
+	for {
+		select {
+			case c, ok := <-u.mpartIn:
+				if !ok {
+					close(responses)
+					return
+				}
+
+				res := make(chan error)
+				responses <- res
+
+				go func(c *chunk, reschan chan error) {
+					defer u.store.allocpool.Free(*(c.ptr))
+					buf := (*(c.ptr))[c.off:c.end]
+					var err error
+					_, err = u.writeChunk(u.key, u.multipartid, c.num, &buf)
+					res <- err
+				}(c, res)
+		}
 	}
-
-	close(workers)
-
-	if err = <-hasError; err != nil {
-		u.err = err
-	}
-
-	u.close()
 }
 
 func (u *Writer) writeChunk(key string, multipartId string, partNum int, b *[]byte) (*s3.UploadPartOutput, error) {
@@ -208,11 +204,6 @@ func (u *Writer) delete() error {
 }
 
 func (writer *Writer) close() error {
-	if writer.isMultipart {
-		close(writer.semaphore)
-		close(writer.mpartIn)
-	}
-
 	if writer.isClosed {
 		return nil
 	}
@@ -238,7 +229,8 @@ func (writer *Writer) Write(b []byte) (nn int, err error) {
 		var n int
 		n = copy(writer.buf[writer.n:], b)
 		writer.n += n
-		writer.Flush()
+		err = writer.Flush()
+		writer.err = err
 		nn += n
 		b = b[n:]
 	}
@@ -268,19 +260,19 @@ func (writer *Writer) Flush() error {
 	}
 	if writer.isMultipart {
 		// first flush with data in it
-		if writer.total  == 0 {
+		if writer.partNum == 0 {
 			// start background process to handle individual chunks in parallel
 			go writer.producer()
 		}
 
 		// wait for available worker
-		writer.semaphore <- 1
+		// writer.semaphore <- 1
 		buf := writer.store.allocpool.Alloc(int(MIN_MULTIPART_SIZE))
 		n = copy(buf, writer.buf[:writer.n])
-		writer.mpartIn <- &worker{ptr: &buf, off: 0, end: int64(n)}
-	}
-	if !writer.isMultipart && uint64(writer.n) >= *writer.length {
-		writer.Close()
+		writer.partNum += 1
+		writer.mpartIn <- &chunk{ptr: &buf, num: writer.partNum, off: 0, end: int64(n)}
+	} else {
+		n = writer.n
 	}
 
 	writer.total += uint64(n)
@@ -298,14 +290,13 @@ func (writer *Writer) Reset(w io.Writer) {
 	writer.total = 0
 	writer.partSize = 0
 	writer.partNum = 0
-	writer.numParts = 0
 	writer.multipartid = ""
 	writer.isClosed = false
 	writer.isMultipart = false
 	writer.err = nil
 }
 
-func (writer *Writer) Close() error {
+func (writer *Writer) Close() (err error) {
 	// flush any underlying data if there's some left to write
 	if writer.Buffered() > 0 {
 		if err := writer.Flush(); err != nil {
@@ -313,33 +304,38 @@ func (writer *Writer) Close() error {
 		}
 	}
 	if writer.isMultipart {
-		// Mark the multipart upload complete
-		if err := writer.finishMultipart(writer.key, writer.multipartid); err != nil {
-			// cleanup from s3
-			writer.delete()
-			writer.n = 0
-			writer.err = err
-			return err
+		// we are done with writing
+		close(writer.mpartIn)
+		// wait for possible error from workers
+		if err = <-writer.mpartDone; err != nil {
+			goto cleanupmp
 		}
-		
+		// Mark the multipart upload complete
+		if err = writer.finishMultipart(writer.key, writer.multipartid); err != nil {
+			goto cleanupmp
+		}
 	} else {
-		if _, err := writer.writeFile(writer.key, int64(writer.n), writer.buf[0:writer.n]); err != nil {
-			writer.n = 0
-			writer.err = err
-			return err
+		if _, err := writer.writeFile(writer.key, int64(writer.total), writer.buf[0:writer.total]); err != nil {
+			goto cleanup
 		}
 	}
 
+cleanupmp:
+	writer.delete()
+cleanup:
+	writer.n = 0
+	writer.err = err
 	writer.isClosed = true
 
-	return nil
+	return err
 } 
 
-func NewWriter(store *FileStore, key string, length *uint64, meta MetaData, concurrency *int) (*Writer, error) {
+func NewWriter(store *FileStore, key string, length *uint64, meta MetaData) (*Writer, error) {
 
 	var (
 		partSize    uint64 = MIN_MULTIPART_SIZE
 		numParts    int = 0
+		concurrency int
 		err 	    error
 	)
 	
@@ -348,33 +344,30 @@ func NewWriter(store *FileStore, key string, length *uint64, meta MetaData, conc
 		return nil, errors.New("store needs to be set")
 	}
 
-	if concurrency == nil {
-		concurrency = new(int)
-		*concurrency = store.MaxConcurrency
-	}
-
 	writer := &Writer{key: key,
 		length: length, 
-		maxWorkers: *concurrency,
 		metadata: meta,
 		store: store}
 
-	if partSize, err = calcOptimalPartSize(*length); err == nil {
-		numParts = int(*length / partSize)
-		if numParts <= 0 {
-			numParts = 1
-		}
+	concurrency = MAX_CONCURRENCY
+	if length != nil {
+		if partSize, err = calcOptimalPartSize(*length); err == nil {
+			numParts = int(*length / partSize)
+			if numParts <= 0 {
+				numParts = 1
+			}
 
-		if numParts < *concurrency {
-			*concurrency = int(numParts)
+			if numParts < MAX_CONCURRENCY {
+				concurrency = int(numParts)
+			}
 		}
 	}
 
-	writer.maxWorkers = *concurrency
+	writer.maxWorkers = concurrency
 
 	// If the content length is not known before hand or the size exceeds MIN_MULTIPART_SIZE,
 	// create multipart upload instead
-	if numParts > 1 {
+	if numParts > 1 || length == nil {
 		id, err := writer.createMultipart(&key, meta)
 		if err != nil {
 			return nil, err
@@ -382,12 +375,12 @@ func NewWriter(store *FileStore, key string, length *uint64, meta MetaData, conc
 
 		writer.multipartid = id
 		writer.isMultipart = true
-		writer.mpartIn = make(chan *worker)
-		writer.semaphore = make(chan int, writer.maxWorkers)
+		writer.mpartIn = make(chan *chunk, 0)
+		writer.mpartDone = make(chan error)
+		// writer.semaphore = make(chan int, writer.maxWorkers)
 	}
 
 	writer.buf = make([]byte, MIN_MULTIPART_SIZE)
-	writer.numParts = numParts
 	writer.partSize = partSize
 	writer.partNum  = 0
 	writer.total = 0
