@@ -17,7 +17,6 @@ These examples demonstrate how to use [terminatewithextremeprejudice/go-aws-s3-i
 
 ## TODO
 
-- [ ] Add io.Reader implementation to read files from S3 Buckets  
 - [ ] Mock AWS SDK for tests
 - [ ] Add support for cancelable requests using `Context`
 - [ ] Update AWS SDK compatibility to v2
