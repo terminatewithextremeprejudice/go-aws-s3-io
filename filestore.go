@@ -30,8 +30,8 @@ const (
 	MIN_MULTIPART_SIZE  uint64 = 1024 * 1024 * 5
 	MAX_MULTIPART_SIZE  uint64 = 1024 * 1024 * 10
 	MAX_MULTIPART_PARTS uint64 = 10000
-	CHUNK_SIZE          uint64 = 1 * 1024 * 1024
-	MAX_CONCURRENCY	    int    = 10
+	CHUNK_SIZE          int    = 1 * 1024 * 1024
+	MAX_CONCURRENCY	    int    = 5
 	MAX_RETRIES         int    = 9
 )
 
@@ -71,8 +71,8 @@ type FileStore struct {
 	// MaxObjectSize is the maximum size an S3 Object can have according to S3
 	// API specifications. See link above.
 	MaxObjectSize uint64
-	// MaxDownloadChunkSize specifies the size range of each individual
-	MaxChunkSize uint64
+	// MaxChunkSize specifies the size range of each individual
+	MaxChunkSize int
 	// MaxConcurrency specifies the maximum number of goroutines per each multipart upload process.
 	MaxConcurrency int
 	// MaxMultipartWorkers specifies the maximum number of goroutines per each multipart upload process.

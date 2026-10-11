@@ -36,7 +36,6 @@ func (u *Writer) producer() {
 	go func() {
 		for errc := range responses {
 			err := <-errc
-			// <- u.semaphore
 
 			if err != nil {
 				u.mpartDone <- err
@@ -265,11 +264,10 @@ func (writer *Writer) Flush() error {
 			go writer.producer()
 		}
 
-		// wait for available worker
-		// writer.semaphore <- 1
 		buf := writer.store.allocpool.Alloc(int(MIN_MULTIPART_SIZE))
 		n = copy(buf, writer.buf[:writer.n])
 		writer.partNum += 1
+		// wait for available worker
 		writer.mpartIn <- &chunk{ptr: &buf, num: writer.partNum, off: 0, end: int64(n)}
 	} else {
 		n = writer.n
@@ -377,7 +375,6 @@ func NewWriter(store *FileStore, key string, length *uint64, meta MetaData) (*Wr
 		writer.isMultipart = true
 		writer.mpartIn = make(chan *chunk, 0)
 		writer.mpartDone = make(chan error)
-		// writer.semaphore = make(chan int, writer.maxWorkers)
 	}
 
 	writer.buf = make([]byte, MIN_MULTIPART_SIZE)
