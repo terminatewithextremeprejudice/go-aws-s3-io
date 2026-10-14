@@ -19,6 +19,7 @@ type Writer struct {
 	total 	    uint64 // total bytes written
 	partSize    uint64
 	partNum     int
+	numParts    int
 	metadata    MetaData
 	store       *FileStore
 	maxWorkers  int
@@ -28,45 +29,6 @@ type Writer struct {
 	err 	    error
 	mpartIn     chan *chunk
 	mpartDone   chan error
-}
-
-func (u *Writer) producer() {
-	var responses chan chan error = make(chan chan error, u.maxWorkers)
-
-	go func() {
-		for errc := range responses {
-			err := <-errc
-
-			if err != nil {
-				u.mpartDone <- err
-				goto exit
-			}
-		}
-
-		u.mpartDone <- nil
-exit:
-	}()
-
-	for {
-		select {
-			case c, ok := <-u.mpartIn:
-				if !ok {
-					close(responses)
-					return
-				}
-
-				res := make(chan error)
-				responses <- res
-
-				go func(c *chunk, reschan chan error) {
-					defer u.store.allocpool.Free(*(c.ptr))
-					buf := (*(c.ptr))[c.off:c.end]
-					var err error
-					_, err = u.writeChunk(u.key, u.multipartid, c.num, &buf)
-					res <- err
-				}(c, res)
-		}
-	}
 }
 
 func (u *Writer) writeChunk(key string, multipartId string, partNum int, b *[]byte) (*s3.UploadPartOutput, error) {
@@ -219,25 +181,25 @@ func (writer *Writer) Buffered() int { return writer.n }
 func (writer *Writer) Total() uint64 { return writer.total }
 
 // Write writes the contents of b into the buffer.
-func (writer *Writer) Write(b []byte) (nn int, err error) {
-	if writer.isClosed {
+func (w *Writer) Write(p []byte) (nn int, err error) {
+	if w.isClosed {
 		return 0, errors.New("cannot write to  closed writer")
 	}
-
-	for len(b) > writer.Available() && writer.err == nil {
-		var n int
-		n = copy(writer.buf[writer.n:], b)
-		writer.n += n
-		err = writer.Flush()
-		writer.err = err
+	if w.err != nil {
+		return 0, w.err
+	}
+	for len(p) > w.Available() && w.err == nil {
+		n := copy(w.buf[w.n:], p)
+		w.n += n
+		w.err = w.Flush()
 		nn += n
-		b = b[n:]
+		p = p[n:]
 	}
-	if writer.err != nil {
-		return nn, writer.err
+	if w.err != nil {
+		return nn, w.err
 	}
-	n := copy(writer.buf[writer.n:], b)
-	writer.n += n
+	n := copy(w.buf[w.n:], p)
+	w.n += n
 	nn += n
 	return nn, nil
 }
@@ -258,19 +220,16 @@ func (writer *Writer) Flush() error {
 		return errors.New("buffer not initialized")
 	}
 	if writer.isMultipart {
-		// first flush with data in it
-		if writer.partNum == 0 {
-			// start background process to handle individual chunks in parallel
-			go writer.producer()
-		}
-
-		buf := writer.store.allocpool.Alloc(int(MIN_MULTIPART_SIZE))
-		n = copy(buf, writer.buf[:writer.n])
 		writer.partNum += 1
-		// wait for available worker
-		writer.mpartIn <- &chunk{ptr: &buf, num: writer.partNum, off: 0, end: int64(n)}
-	} else {
-		n = writer.n
+		buf := writer.store.allocpool.Alloc(int(MIN_MULTIPART_SIZE))
+		defer writer.store.allocpool.Free(buf)
+		n = copy(buf[0:], writer.buf[:writer.n])
+		slice := buf[:n]
+		_, err := writer.writeChunk(writer.key, writer.multipartid, writer.partNum, &slice)
+		if err != nil {
+			writer.err = err
+			return err
+		}
 	}
 
 	writer.total += uint64(n)
@@ -295,20 +254,10 @@ func (writer *Writer) Reset(w io.Writer) {
 }
 
 func (writer *Writer) Close() (err error) {
-	// flush any underlying data if there's some left to write
-	if writer.Buffered() > 0 {
-		if err := writer.Flush(); err != nil {
-			return err
-		}
+	if writer.err != nil {
+		return writer.err
 	}
 	if writer.isMultipart {
-		// we are done with writing
-		close(writer.mpartIn)
-		// wait for possible error from workers
-		if err = <-writer.mpartDone; err != nil {
-			goto cleanupmp
-		}
-		// Mark the multipart upload complete
 		if err = writer.finishMultipart(writer.key, writer.multipartid); err != nil {
 			goto cleanupmp
 		}
@@ -379,6 +328,7 @@ func NewWriter(store *FileStore, key string, length *uint64, meta MetaData) (*Wr
 
 	writer.buf = make([]byte, MIN_MULTIPART_SIZE)
 	writer.partSize = partSize
+	writer.numParts = numParts
 	writer.partNum  = 0
 	writer.total = 0
 	writer.n = 0
